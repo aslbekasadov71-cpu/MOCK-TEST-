@@ -14,9 +14,9 @@ import os
 import random
 import re
 from datetime import datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,7 +29,9 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @kanal_nomi yoki -100...; bot kanalga admin bo'lishi kerak
-DB_PATH = os.getenv("DB_PATH", "mock_bot.db")
+DB_PATH = os.getenv("DB_PATH", "mock_bot.db")  # DATABASE_URL bo'lmasa SQLite ishlatiladi
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Neon / Supabase Postgres manzili
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mock-bot-secret")
 PORT = int(os.getenv("PORT", "8080"))
@@ -47,7 +49,7 @@ _bg_tasks = set()
 
 
 def esc(s) -> str:
-    return html.escape(str(s or ""))
+    return html.escape(str(s or ""), quote=False)
 
 
 def is_teacher(uid: int) -> bool:
@@ -68,51 +70,107 @@ def show_dt(s: str) -> str:
 
 
 # ---------------- Ma'lumotlar bazasi ----------------
+# DATABASE_URL berilsa Postgres (Neon/Supabase), aks holda SQLite fayl.
+if USE_PG:
+    import asyncpg
+    DupError = asyncpg.UniqueViolationError
+else:
+    import aiosqlite
+    DupError = aiosqlite.IntegrityError
+
+_pool = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    id BIGINT PRIMARY KEY,
+    full_name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tests(
+    code TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    answers TEXT NOT NULL,
+    owner_id BIGINT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS submissions(
+    id {serial},
+    test_code TEXT NOT NULL,
+    user_id BIGINT NOT NULL,
+    answers TEXT NOT NULL,
+    correct INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    tscore DOUBLE PRECISION,
+    grade TEXT,
+    rank INTEGER,
+    UNIQUE(test_code, user_id)
+);
+"""
+
+
+def _pg(sql: str) -> str:
+    """SQLite uslubidagi ? belgilarini Postgres'ning $1, $2 ... ko'rinishiga o'tkazadi."""
+    out, n = [], 0
+    for ch in sql:
+        if ch == "?":
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _clean_pg_url(url: str) -> str:
+    """Neon manzilidagi asyncpg tushunmaydigan parametrlarni olib tashlaydi."""
+    parts = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(parts.query) if k not in ("channel_binding", "options")]
+    return urlunsplit(parts._replace(query=urlencode(q)))
+
+
 async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                id INTEGER PRIMARY KEY,
-                full_name TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS tests(
-                code TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                answers TEXT NOT NULL,
-                owner_id INTEGER NOT NULL,
-                start_at TEXT NOT NULL,
-                end_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS submissions(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                test_code TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                answers TEXT NOT NULL,
-                correct INTEGER NOT NULL,
-                total INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                tscore REAL,
-                grade TEXT,
-                rank INTEGER,
-                UNIQUE(test_code, user_id)
-            );
-            """
+    global _pool
+    if USE_PG:
+        _pool = await asyncpg.create_pool(
+            _clean_pg_url(DATABASE_URL), min_size=1, max_size=5,
+            statement_cache_size=0,               # Supabase pooler bilan ham ishlashi uchun
+            max_inactive_connection_lifetime=60,  # Neon uxlab qolsa, eski ulanishlar yangilanadi
         )
-        await db.commit()
+        await _pool.execute(SCHEMA.format(serial="SERIAL PRIMARY KEY"))
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.executescript(SCHEMA.format(serial="INTEGER PRIMARY KEY AUTOINCREMENT"))
+            await db.commit()
 
 
 async def db_exec(sql, params=()):
     """O'zgargan qatorlar sonini qaytaradi."""
+    if USE_PG:
+        status = await _pool.execute(_pg(sql), *params)
+        try:
+            return int(status.split()[-1])
+        except (ValueError, IndexError):
+            return 0
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, params)
         await db.commit()
         return cur.rowcount
 
 
+async def db_many(sql, rows):
+    if USE_PG:
+        await _pool.executemany(_pg(sql), rows)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(sql, rows)
+        await db.commit()
+
+
 async def db_one(sql, params=()):
+    if USE_PG:
+        return await _pool.fetchrow(_pg(sql), *params)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, params) as cur:
@@ -120,6 +178,8 @@ async def db_one(sql, params=()):
 
 
 async def db_all(sql, params=()):
+    if USE_PG:
+        return await _pool.fetch(_pg(sql), *params)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, params) as cur:
@@ -315,13 +375,14 @@ async def _compute_results(code: str) -> bool:
             theta, _ = rasch(matrix)
             ts = t_scores(theta)
             order = sorted(range(len(subs)), key=lambda i: (-ts[i], -subs[i]["correct"]))
-            rank = {i: pos for pos, i in enumerate(order, 1)}
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.executemany(
-                    "UPDATE submissions SET tscore=?, grade=?, rank=? WHERE id=?",
-                    [(ts[i], grade_of(ts[i]), rank[i], subs[i]["id"]) for i in range(len(subs))],
-                )
-                await db.commit()
+            rank = {}  # bir xil ball - bir xil o'rin (1, 2, 2, 4 ...)
+            for pos, i in enumerate(order, 1):
+                prev = order[pos - 2] if pos > 1 else None
+                rank[i] = rank[prev] if prev is not None and ts[prev] == ts[i] else pos
+            await db_many(
+                "UPDATE submissions SET tscore=?, grade=?, rank=? WHERE id=?",
+                [(float(ts[i]), grade_of(ts[i]), rank[i], subs[i]["id"]) for i in range(len(subs))],
+            )
         return True
 
 
@@ -454,7 +515,8 @@ async def reg_name(m: Message, state: FSMContext):
     if len(name) < 3 or len(name) > 60 or name.startswith("/"):
         await m.answer("Iltimos, ism va familiyangizni to'g'ri yozing:")
         return
-    await db_exec("INSERT OR REPLACE INTO users(id, full_name) VALUES(?, ?)", (m.from_user.id, name))
+    await db_exec("INSERT INTO users(id, full_name) VALUES(?, ?) "
+                  "ON CONFLICT(id) DO UPDATE SET full_name = excluded.full_name", (m.from_user.id, name))
     data = await state.get_data()
     await state.clear()
     await m.answer(f"✅ Rahmat, {esc(name)}!", reply_markup=student_kb)
@@ -746,7 +808,7 @@ async def process_submission(m: Message, code: str, raw: str) -> bool:
             "INSERT INTO submissions(test_code, user_id, answers, correct, total, created_at) VALUES(?,?,?,?,?,?)",
             (code, m.from_user.id, ans, correct, len(key), now()),
         )
-    except aiosqlite.IntegrityError:
+    except DupError:
         await m.answer("⚠️ Siz bu testga allaqachon javob yuborgansiz.")
         return True
     await m.answer(
