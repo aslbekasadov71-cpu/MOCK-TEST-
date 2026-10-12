@@ -1,45 +1,41 @@
-# Test tekshiruvchi Telegram bot
+# Mock imtihon boti (Rasch modeli)
 
-## Qanday ishlaydi
-**Ustoz:**
-1. «➕ Yangi test» → test nomi → to'g'ri javoblar (`abcdabcd` yoki `1a 2b 3c`)
-2. Bot 4 xonali **test kodi** beradi, uni o'quvchilarga aytasiz
-3. «📋 Testlarim» → `/natija_1234` bilan reyting, o'rtacha ball va eng ko'p xato qilingan savollarni ko'rasiz
-4. `/yopish_1234` buyrug'i testni yopadi va har bir o'quvchiga to'g'ri javoblarni yuboradi
+## Ishlash tartibi
+**Ustoz** «➕ Yangi test» tugmasini bosib 5 qadamni bajaradi:
+1. Test nomi
+2. Kod (`mock002` yoki `avto`)
+3. To'g'ri javoblar (`abcd...` yoki `1a 2b 3c`)
+4. Boshlanish vaqti (`hozir`, `10:00`, `15.10 10:00`)
+5. Tugash vaqti (`12:30` yoki daqiqada `150`)
 
-**O'quvchi:**
-1. /start → ism-familiyasini yozadi (bir marta)
-2. «✍️ Javob yuborish» → kod → javoblar. Yoki bitta xabarda: `1234*abcdabcd`
-3. Har bir savol bo'yicha ✅ yoki ❌ va umumiy ball chiqadi
+**O'quvchi** belgilangan vaqt ichida botga `mock002*abcd...` yuboradi yoki «✍️ Javob yuborish» tugmasini bosadi.
+Bot faqat «qabul qilindi» deb javob beradi. Javob faqat bir marta qabul qilinadi.
 
-Qo'shimcha imkoniyatlar:
-- Har o'quvchi bitta testga faqat bir marta javob yubora oladi.
-- Javoblar soni noto'g'ri bo'lsa, bot qayta yuborishni so'raydi.
-- Kirill harflar (А, В, С, Д) ham qabul qilinadi.
-- To'g'ri javob test yopilguncha ko'rsatilmaydi, shuning uchun o'quvchilar bir-biriga javob tarqata olmaydi.
+**Vaqt tugagach** bot avtomatik ravishda:
+- Rasch modeli bo'yicha ball (T-ball), foiz, daraja va o'rinni hisoblaydi
+- har bir o'quvchiga natijasini ✅/❌ va to'g'ri javoblar bilan yuboradi
+- kanalga reytingni joylaydi (`CHANNEL_ID` berilgan bo'lsa)
+- ustozga umumiy hisobot va eng ko'p xato qilingan savollar ro'yxatini yuboradi
 
-## O'rnatish
-1. @BotFather → `/newbot` → **token** oling
-2. Ustozning Telegram ID'sini toping: botni ishga tushirib `/id` yozing (yoki @userinfobot orqali)
-3. Muhit o'zgaruvchilari:
-   - `BOT_TOKEN` — token
-   - `ADMIN_IDS` — ustoz ID'lari, vergul bilan: `12345678,87654321`
-   - `WEBHOOK_URL` — faqat Render uchun: `https://sizning-bot.onrender.com`
-   - `DB_PATH` — ixtiyoriy, baza fayli yo'li
+Ustoz buyruqlari: `/natija_mock002` (joriy holat yoki yakuniy natija), `/yakun_mock002` (muddatidan oldin yakunlash).
 
-### Kompyuterda / VPS'da
-```
-pip install -r requirements.txt
-BOT_TOKEN=... ADMIN_IDS=... python bot.py
-```
+## Ball qanday hisoblanadi
+- Rasch (1 parametrli IRT) modeli JML usulida baholanadi. Har bir o'quvchi uchun qobiliyat (θ), har bir savol uchun qiyinlik hisoblanadi.
+- T-ball = 50 + 10 × Z. Ishtirokchilar o'rtachasi 50 ball bo'ladi.
+- Daraja chegaralari: A+ ≥70, A ≥65, B+ ≥60, B ≥55, C+ ≥50, C ≥46. Ular `bot.py` dagi `GRADES` qatorida o'zgartiriladi.
+- Ishtirokchilar soni kam bo'lsa (taxminan 20 tadan kam), ball ishonchli chiqmaydi.
 
-### Render'da
-- New → **Web Service** → GitHub repo
-- Build: `pip install -r requirements.txt`
-- Start: `python bot.py`
-- Environment: `BOT_TOKEN`, `ADMIN_IDS`, `WEBHOOK_URL`
+## Sozlamalar (Environment)
+| Nomi | Tavsif |
+|---|---|
+| `BOT_TOKEN` | @BotFather bergan token |
+| `ADMIN_IDS` | Ustoz ID'lari, vergul bilan ajratiladi |
+| `CHANNEL_ID` | `@kanal_nomi` yoki `-100...`. Bot kanalda admin bo'lishi shart |
+| `WEBHOOK_URL` | Render manzili, masalan `https://xxx.onrender.com` |
+| `PYTHON_VERSION` | `3.12.7` |
+| `DB_PATH` | ixtiyoriy, Persistent Disk ulansa `/var/data/mock_bot.db` |
 
-⚠️ **Muhim:** Render'ning bepul tarifida disk vaqtinchalik. Har restart yoki deployda SQLite bazasi o'chib ketadi.
-Real mijoz uchun quyidagilardan birini tanlang:
-- Render **Persistent Disk** ulang va `DB_PATH=/var/data/test_bot.db` qiling (pullik)
-- Arzon VPS'da polling rejimida ishlating (`WEBHOOK_URL` qo'ymasdan)
+## Render bo'yicha eslatmalar
+- Bepul tarifda servis 15 daqiqa ishlatilmasa uxlab qoladi. Shunda test vaqtida tugamaydi, faqat keyingi xabar kelganda yakunlanadi.
+  Buning oldini olish uchun UptimeRobot (bepul) orqali `https://xxx.onrender.com/` manzilini har 5 daqiqada ping qiling.
+- Bepul diskdagi baza har deployda o'chadi. Real ishlatish uchun Persistent Disk yoki VPS kerak.
