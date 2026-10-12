@@ -41,6 +41,7 @@ PORT = int(os.getenv("PORT", "8080"))
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tashkent"))
 CHANNEL_TOP = int(os.getenv("CHANNEL_TOP", "100"))  # kanalga nechta o'rin chiqarilsin
 MIN_GROUP = int(os.getenv("MIN_GROUP", "10"))  # shundan kam ishtirokchida mutlaq shkala
+KEEP_AWAKE_MIN = int(os.getenv("KEEP_AWAKE_MIN", "10"))  # o'zini uyg'otish oralig'i (daqiqa)
 
 # Daraja chegaralari (T-ball bo'yicha). Kerak bo'lsa o'zgartiring.
 GRADES = [(70, "A+"), (65, "A"), (60, "B+"), (55, "B"), (50, "C+"), (46, "C")]
@@ -530,6 +531,23 @@ async def check_due(bot: Bot):
         await finalize_test(bot, r["code"])
 
 
+async def keep_awake():
+    """Render bepul tarifi 15 daqiqa so'rov kelmasa servisni uxlatadi.
+    Bot har 10 daqiqada o'z manzilini ochib turadi, shuning uchun uxlamaydi."""
+    if not WEBHOOK_URL:
+        return
+    import aiohttp
+    await asyncio.sleep(60)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(WEBHOOK_URL + "/", timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    logging.info("keep-awake ping: %s", r.status)
+            except Exception as e:
+                logging.warning("keep-awake ping xatosi: %s", e)
+            await asyncio.sleep(KEEP_AWAKE_MIN * 60)
+
+
 async def scheduler(bot: Bot):
     while True:
         try:
@@ -990,6 +1008,7 @@ async def on_startup(bot: Bot):
     else:
         await bot.delete_webhook()
     run_bg(scheduler(bot))
+    run_bg(keep_awake())
     await setup_menu(bot)
 
 
