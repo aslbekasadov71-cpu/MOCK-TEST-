@@ -8,12 +8,14 @@ har bir o'quvchiga ✅/❌ bilan natija yuboradi va kanalga reytingni joylaydi.
 """
 import asyncio
 import html
+import json
 import logging
 import math
 import os
 import random
 import re
 from datetime import datetime, timedelta
+from fractions import Fraction
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -23,7 +25,8 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
+                           KeyboardButton, Message, ReplyKeyboardMarkup)
 
 # ---------------- Sozlamalar ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -37,6 +40,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mock-bot-secret")
 PORT = int(os.getenv("PORT", "8080"))
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tashkent"))
 CHANNEL_TOP = int(os.getenv("CHANNEL_TOP", "100"))  # kanalga nechta o'rin chiqarilsin
+MIN_GROUP = int(os.getenv("MIN_GROUP", "10"))  # shundan kam ishtirokchida mutlaq shkala
 
 # Daraja chegaralari (T-ball bo'yicha). Kerak bo'lsa o'zgartiring.
 GRADES = [(70, "A+"), (65, "A"), (60, "B+"), (55, "B"), (50, "C+"), (46, "C")]
@@ -187,29 +191,119 @@ async def db_all(sql, params=()):
 
 
 # ---------------- Javoblar va vaqtni o'qish ----------------
+# Javob turlari:
+#   harfli (yopiq) savol  -> 'a'..'f'
+#   yozma (ochiq) savol   -> istalgan matn: 12, -3/4, 0.5, 2x+1 ...; bir nechta to'g'ri variant: 12|-12
 CYR = str.maketrans({"а": "a", "б": "b", "в": "b", "с": "c", "ц": "c",
                      "д": "d", "е": "e", "э": "e", "ф": "f"})
+OPEN_MAP = str.maketrans({"−": "-", "–": "-", "—": "-", "х": "x", "у": "y", "×": "*", "·": "*", "÷": "/"})
 VALID = set("abcdef")
+FORMAT_HELP = (
+    "Formatlar:\n"
+    "• faqat harfli: <code>abcdabcd</code>\n"
+    "• yozma javoblar bo'lsa, vergul bilan: <code>a, b, c, 12, -3/4, 2x+1</code>\n"
+    "  (o'nli kasr nuqta bilan: <code>0.5</code>)"
+)
+
+
+def is_letter(x: str) -> bool:
+    return len(x) == 1 and x in VALID
+
+
+def _item(x: str) -> str:
+    """Bitta javobni tozalaydi: harf bo'lsa kichik lotin harf, aks holda matn o'zi."""
+    x = x.strip()
+    low = x.lower().translate(CYR)
+    return low if is_letter(low) else x
 
 
 def parse_answers(text: str):
-    """'abcdab...' yoki '1a 2b 3c' / '1-a, 2-b'. Qaytaradi: (javoblar, xato_matni)"""
-    t = (text or "").lower().translate(CYR)
-    if re.search(r"\d", t):
-        pairs = re.findall(r"(\d+)\s*[\)\.\-:=]?\s*([a-z])", t)
-        if not pairs:
-            return None, "Javoblarni o'qib bo'lmadi. Masalan: <code>1a2b3c4d</code>"
-        d = {int(n): letter for n, letter in pairs}
+    """Qaytaradi: (javoblar_ro'yxati, xato_matni)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None, "Javob bo'sh.\n" + FORMAT_HELP
+    if re.search(r"[,;\n]", raw):  # ro'yxat: vergul / nuqtali vergul / yangi qator
+        items = [x.strip() for x in re.split(r"[,;\n]+", raw) if x.strip()]
+        # '36) 12' kabi raqamlangan bo'lsa (hammasi 1..n bo'lib raqamlangan bo'lsagina) raqamni olib tashlaymiz
+        numbered = [re.match(r"^(\d+)\s*(?:[\)\-:=]|\.\s)\s*(.+)$", it) for it in items]
+        if all(numbered) and sorted(int(mm.group(1)) for mm in numbered) == list(range(1, len(items) + 1)):
+            items = [mm.group(2) for mm in sorted(numbered, key=lambda mm: int(mm.group(1)))]
+        return [_item(x) for x in items], None
+    t = raw.lower().translate(CYR)
+    if re.fullmatch(r"[a-f\s]+", t):  # abcdabcd
+        return list(re.sub(r"\s", "", t)), None
+    if re.fullmatch(r"(\s*\d+\s*[\)\.\-:=]?\s*[a-f]\s*)+", t):  # 1a 2b 3c
+        d = {int(n): letter for n, letter in re.findall(r"(\d+)\s*[\)\.\-:=]?\s*([a-f])", t)}
         n = max(d)
         missing = [i for i in range(1, n + 1) if i not in d]
         if missing:
             return None, f"Quyidagi savollarga javob yo'q: {', '.join(map(str, missing[:15]))}"
-        res = [d[i] for i in range(1, n + 1)]
-    else:
-        res = [c for c in t if c.isalpha()]
-    if not res or any(c not in VALID for c in res):
-        return None, "Faqat A, B, C, D (E, F) harflaridan foydalaning."
-    return "".join(res), None
+        return [d[i] for i in range(1, n + 1)], None
+    return None, "Javoblarni o'qib bo'lmadi.\n" + FORMAT_HELP
+
+
+def _norm_open(s: str) -> str:
+    return re.sub(r"\s+", "", s.lower().translate(OPEN_MAP))
+
+
+def _as_number(s: str):
+    try:
+        return Fraction(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def is_correct(a: str, k: str) -> bool:
+    """Harfli savolda to'liq moslik; yozma savolda bo'sh joy/registr farq qilmaydi,
+    sonlar qiymati bo'yicha solishtiriladi (0.5 = 1/2), '|' bilan bir nechta to'g'ri variant."""
+    if is_letter(k):
+        return a == k
+    na = _norm_open(a)
+    for alt in k.split("|"):
+        nk = _norm_open(alt)
+        if na == nk:
+            return True
+        fa, fk = _as_number(na), _as_number(nk)
+        if fa is not None and fk is not None and fa == fk:
+            return True
+    return False
+
+
+def dump_ans(lst) -> str:
+    return json.dumps(lst, ensure_ascii=False)
+
+
+def load_ans(s) -> list:
+    """Bazadagi javoblar: JSON ro'yxat (yangi) yoki 'abcd' qatori (eski)."""
+    if isinstance(s, list):
+        return s
+    return json.loads(s) if s.startswith("[") else list(s)
+
+
+def disp(x: str) -> str:
+    """Ko'rsatish uchun: harf -> katta harf, yozma javob -> o'zi (HTML xavfsiz)."""
+    if is_letter(x):
+        return x.upper()
+    return " yoki ".join(esc(p.strip()) for p in x.split("|"))
+
+
+def types_text(key) -> str:
+    """'1–35: harf · 36–45: yozma javob' ko'rinishidagi tavsif."""
+    parts, start = [], 0
+    for i in range(1, len(key) + 1):
+        if i == len(key) or is_letter(key[i]) != is_letter(key[start]):
+            rng = f"{start + 1}" if i - 1 == start else f"{start + 1}–{i}"
+            parts.append(f"{rng}: {'harf (A–F)' if is_letter(key[start]) else 'yozma javob'}")
+            start = i
+    return " · ".join(parts)
+
+
+def answer_hint(key) -> str:
+    if all(is_letter(k) for k in key):
+        return "Javoblaringizni yuboring:\n<code>abcdabcd...</code>  yoki  <code>1a 2b 3c ...</code>"
+    return ("Javoblaringizni <b>vergul bilan</b> ajratib yuboring:\n"
+            "<code>a, b, c, ..., 12, -3/4, 2x+1</code>\n"
+            "O'nli kasr nuqta bilan yoziladi: <code>0.5</code>")
 
 
 def parse_when(text: str, start: datetime = None):
@@ -272,12 +366,15 @@ def rasch(matrix, iters=300, tol=1e-4):
 
 
 def t_scores(theta):
-    """T-ball: 50 + 10*Z (o'rtacha 50, standart og'ish 10)."""
+    """T-ball.
+    Ishtirokchilar yetarli bo'lsa: 50 + 10*Z (guruh o'rtachasi 50, standart og'ish 10).
+    Kam bo'lsa (MIN_GROUP dan kam): mutlaq shkala 50 + 10*theta, guruhga bog'liq emas,
+    aks holda bitta o'quvchi 0/5 ishlasa ham 50 ball olib qoladi."""
     n = len(theta)
     mean = sum(theta) / n
     sd = math.sqrt(sum((x - mean) ** 2 for x in theta) / n)
-    if sd < 1e-9:
-        return [50.0] * n
+    if n < MIN_GROUP or sd < 1e-6:
+        return [round(min(100.0, max(0.0, 50 + 10 * x)), 1) for x in theta]
     return [round(max(0.0, 50 + 10 * (x - mean) / sd), 1) for x in theta]
 
 
@@ -293,7 +390,7 @@ MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
 def final_result_text(test, s, participants: int) -> str:
-    key, ans = test["answers"], s["answers"]
+    key, ans = load_ans(test["answers"]), load_ans(s["answers"])
     total = len(key)
     lines = [
         f"🏁 <b>{esc(test['title'])}</b> — yakuniy natija",
@@ -307,12 +404,12 @@ def final_result_text(test, s, participants: int) -> str:
         "",
     ]
     for i, (a, k) in enumerate(zip(ans, key), 1):
-        lines.append(f"{i}. {a.upper()} ✅" if a == k else f"{i}. {a.upper()} ❌  (to'g'ri: {k.upper()})")
+        lines.append(f"{i}. {disp(a)} ✅" if is_correct(a, k) else f"{i}. {disp(a)} ❌  (to'g'ri: {disp(k)})")
     return "\n".join(lines)
 
 
 def ranking_text(test, subs, limit=None) -> str:
-    total = len(test["answers"])
+    total = len(load_ans(test["answers"]))
     lines = [
         f"🏁 <b>{esc(test['title'])}</b> natijalari",
         f"🔑 Kod: <code>{esc(test['code'])}</code> · ❓ {total} savol",
@@ -336,11 +433,11 @@ def ranking_text(test, subs, limit=None) -> str:
 
 
 def hardest_text(test, subs) -> str:
-    key = test["answers"]
+    key = load_ans(test["answers"])
     wrong = [0] * len(key)
     for s in subs:
-        for q, (a, k) in enumerate(zip(s["answers"], key)):
-            if a != k:
+        for q, (a, k) in enumerate(zip(load_ans(s["answers"]), key)):
+            if not is_correct(a, k):
                 wrong[q] += 1
     top = sorted(((w, q + 1) for q, w in enumerate(wrong) if w), reverse=True)[:5]
     if not top:
@@ -370,8 +467,8 @@ async def _compute_results(code: str) -> bool:
         test = await db_one("SELECT * FROM tests WHERE code=?", (code,))
         subs = await db_all("SELECT id, answers, correct FROM submissions WHERE test_code=?", (code,))
         if subs:
-            key = test["answers"]
-            matrix = [[1 if a == k else 0 for a, k in zip(s["answers"], key)] for s in subs]
+            key = load_ans(test["answers"])
+            matrix = [[1 if is_correct(a, k) else 0 for a, k in zip(load_ans(s["answers"]), key)] for s in subs]
             theta, _ = rasch(matrix)
             ts = t_scores(theta)
             order = sorted(range(len(subs)), key=lambda i: (-ts[i], -subs[i]["correct"]))
@@ -563,9 +660,11 @@ async def nt_code(m: Message, state: FSMContext):
     await state.update_data(code=code)
     await state.set_state(NewTest.answers)
     await m.answer(
-        f"Kod: <code>{code}</code>\n\n3/5. <b>To'g'ri javoblarni</b> yuboring:\n"
-        "• ketma-ket: <code>abcdabcdab</code>\n"
-        "• yoki raqam bilan: <code>1a 2b 3c 4d</code>"
+        f"Kod: <code>{code}</code>\n\n3/5. <b>To'g'ri javoblarni</b> yuboring.\n\n"
+        "• faqat harfli: <code>abcdabcdab</code> yoki <code>1a 2b 3c</code>\n"
+        "• yozma javoblar bo'lsa, <b>vergul bilan</b>:\n<code>a, b, c, d, 12, -3/4, 2x+1</code>\n\n"
+        "Bir nechta to'g'ri variant: <code>12|-12</code>\n"
+        "O'nli kasr nuqta bilan: <code>0.5</code> (0.5 va 1/2 bir xil hisoblanadi)"
     )
 
 
@@ -575,10 +674,10 @@ async def nt_answers(m: Message, state: FSMContext):
     if err:
         await m.answer(f"⚠️ {err}\nQaytadan yuboring:")
         return
-    await state.update_data(answers=key)
+    await state.update_data(answers=dump_ans(key))
     await state.set_state(NewTest.start)
     await m.answer(
-        f"✅ {len(key)} ta savol qabul qilindi.\n\n"
+        f"✅ {len(key)} ta savol qabul qilindi: {types_text(key)}\n\n"
         "4/5. Test <b>qachon boshlanadi</b>?\n"
         "• <code>hozir</code>\n• <code>10:00</code> (bugun)\n• <code>15.10 10:00</code>"
     )
@@ -621,16 +720,18 @@ async def nt_end(m: Message, state: FSMContext):
         (code, data["title"], key, m.from_user.id, data["start"], end.strftime(FMT), now()),
     )
     await state.clear()
-    key_view = "  ".join(f"{i}{c.upper()}" for i, c in enumerate(key, 1))
+    key_list = load_ans(key)
+    key_view = "  ".join(f"{i}) {disp(c)}" for i, c in enumerate(key_list, 1))
+    sample = "abcd..." if all(is_letter(k) for k in key_list) else "a, b, c, ..., 12, -3/4"
     await m.answer(
         f"✅ <b>Test yaratildi!</b>\n\n"
         f"📝 {esc(data['title'])}\n"
         f"🔑 Kod: <code>{code}</code>\n"
-        f"❓ Savollar: {len(key)}\n"
+        f"❓ Savollar: {len(key_list)} ({types_text(key_list)})\n"
         f"🕙 {show_dt(data['start'])} — {show_dt(end.strftime(FMT))}\n\n"
         f"Javoblar: {key_view}\n\n"
         f"<b>O'quvchilar uchun e'lon:</b>\n"
-        f"Javoblarni botga yuboring: <code>{code}*abcd...</code>\n"
+        f"Javoblarni botga yuboring: <code>{code}*{sample}</code>\n"
         f"yoki «✍️ Javob yuborish» → kod: <code>{code}</code>\n\n"
         f"Vaqt tugagach bot Rasch modeli bo'yicha hisoblab, hammaga natijani yuboradi"
         + (" va kanalga joylaydi." if CHANNEL_ID else ".")
@@ -647,7 +748,7 @@ async def my_tests(m: Message, state: FSMContext):
         return
     await state.clear()
     rows = await db_all(
-        """SELECT t.*, length(t.answers) AS n,
+        """SELECT t.*,
                   (SELECT COUNT(*) FROM submissions s WHERE s.test_code = t.code) AS c
            FROM tests t WHERE t.owner_id = ? ORDER BY t.created_at DESC LIMIT 30""",
         (m.from_user.id,),
@@ -666,7 +767,7 @@ async def my_tests(m: Message, state: FSMContext):
             status = "🟢 davom etmoqda"
         lines.append(
             f"<b>{esc(r['title'])}</b> — <code>{esc(r['code'])}</code>\n"
-            f"{status} · {r['n']} savol · {r['c']} ishtirokchi\n"
+            f"{status} · {len(load_ans(r['answers']))} savol · {r['c']} ishtirokchi\n"
             f"🕙 {show_dt(r['start_at'])} — {show_dt(r['end_at'])}\n"
             f"/natija_{r['code']}" + (f"   /yakun_{r['code']}" if r["status"] == "open" else "") + "\n"
         )
@@ -703,7 +804,7 @@ async def test_results(m: Message, bot: Bot):
            WHERE s.test_code = ? ORDER BY s.correct DESC, s.created_at ASC""",
         (code,),
     )
-    total = len(test["answers"])
+    total = len(load_ans(test["answers"]))
     lines = [
         f"⏳ <b>{esc(test['title'])}</b> (<code>{esc(code)}</code>) — test davom etmoqda",
         f"🕙 Tugaydi: {show_dt(test['end_at'])}",
@@ -779,12 +880,13 @@ async def submit_code(m: Message, state: FSMContext):
             return  # kod noto'g'ri - qayta kiritsin
         await state.clear()
         return
+    key = load_ans(test["answers"])
     await state.update_data(code=code)
     await state.set_state(Submit.answers)
     await m.answer(
-        f"📝 <b>{esc(test['title'])}</b>\n❓ Savollar soni: <b>{len(test['answers'])}</b>\n"
-        f"🕙 Tugaydi: {show_dt(test['end_at'])}\n\n"
-        f"Javoblaringizni yuboring:\n<code>abcdabcd...</code>  yoki  <code>1a 2b 3c ...</code>"
+        f"📝 <b>{esc(test['title'])}</b>\n❓ Savollar soni: <b>{len(key)}</b>\n"
+        f"📋 {types_text(key)}\n"
+        f"🕙 Tugaydi: {show_dt(test['end_at'])}\n\n" + answer_hint(key)
     )
 
 
@@ -793,20 +895,27 @@ async def process_submission(m: Message, code: str, raw: str) -> bool:
     test = await check_test_available(m, code)
     if not test:
         return True
+    key = load_ans(test["answers"])
+    has_open = not all(is_letter(k) for k in key)
+    if has_open and not re.search(r"[,;\n]", raw.strip()):
+        if len(key) == 1:  # bitta yozma savolli test
+            raw = raw + ","
+        else:  # yozma javoblar bor-u, o'quvchi 'abcd' ko'rinishida yuborgan
+            await m.answer(f"⚠️ Bu testda yozma javobli savollar bor ({types_text(key)}).\n\n{answer_hint(key)}")
+            return False
     ans, err = parse_answers(raw)
     if err:
-        await m.answer(f"⚠️ {err}\nQaytadan yuboring:")
+        await m.answer(f"⚠️ {err}\n\n{answer_hint(key)}")
         return False
-    key = test["answers"]
     if len(ans) != len(key):
-        await m.answer(f"⚠️ Test <b>{len(key)}</b> ta savoldan iborat, siz <b>{len(ans)}</b> ta javob yubordingiz.\n"
-                       f"Qaytadan to'liq yuboring:")
+        await m.answer(f"⚠️ Test <b>{len(key)}</b> ta savoldan iborat ({types_text(key)}), "
+                       f"siz <b>{len(ans)}</b> ta javob yubordingiz.\n\n{answer_hint(key)}")
         return False
-    correct = sum(a == k for a, k in zip(ans, key))
+    correct = sum(is_correct(a, k) for a, k in zip(ans, key))
     try:
         await db_exec(
             "INSERT INTO submissions(test_code, user_id, answers, correct, total, created_at) VALUES(?,?,?,?,?,?)",
-            (code, m.from_user.id, ans, correct, len(key), now()),
+            (code, m.from_user.id, dump_ans(ans), correct, len(key), now()),
         )
     except DupError:
         await m.answer("⚠️ Siz bu testga allaqachon javob yuborgansiz.")
@@ -815,7 +924,7 @@ async def process_submission(m: Message, code: str, raw: str) -> bool:
         f"✅ <b>Javoblaringiz qabul qilindi!</b>\n\n"
         f"📝 {esc(test['title'])}\n"
         f"🔑 Kod: <code>{esc(code)}</code>\n"
-        f"Javoblar: <code>{ans.upper()}</code>\n\n"
+        f"Javoblar: {', '.join(f'{i}) {disp(a)}' for i, a in enumerate(ans, 1))}\n\n"
         f"📊 Natija (ball, daraja, ✅/❌) test tugagach — <b>{show_dt(test['end_at'])}</b> dan keyin yuboriladi.",
         reply_markup=student_kb,
     )
@@ -881,6 +990,43 @@ async def on_startup(bot: Bot):
     else:
         await bot.delete_webhook()
     run_bg(scheduler(bot))
+    await setup_menu(bot)
+
+
+async def setup_menu(bot: Bot):
+    """Chap pastdagi «Menu» tugmasi va bot tavsifi."""
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="▶️ Botni ishga tushirish"),
+                BotCommand(command="bekor", description="❌ Bekor qilish"),
+            ],
+            scope=BotCommandScopeDefault(),
+        )
+        for uid in ADMIN_IDS:  # ustozlarga qo'shimcha buyruqlar
+            try:
+                await bot.set_my_commands(
+                    [
+                        BotCommand(command="start", description="▶️ Bosh menyu"),
+                        BotCommand(command="yangi", description="➕ Yangi test yaratish"),
+                        BotCommand(command="testlar", description="📋 Testlarim"),
+                        BotCommand(command="bekor", description="❌ Bekor qilish"),
+                    ],
+                    scope=BotCommandScopeChat(chat_id=uid),
+                )
+            except Exception:
+                pass  # ustoz botga hali yozmagan bo'lsa
+        await bot.set_my_short_description(short_description="Mock testlar: javob yuboring, Rasch ball va daraja oling.")
+        await bot.set_my_description(
+            description=(
+                "📝 Mock test boti\n\n"
+                "• Ustoz bergan test kodini va javoblaringizni yuborasiz\n"
+                "• Test tugagach Rasch modeli bo'yicha ball, daraja va ✅/❌ natija keladi\n\n"
+                "Boshlash uchun «START» tugmasini bosing 👇"
+            )
+        )
+    except Exception:
+        logging.exception("Menu sozlanmadi")
 
 
 def main():
